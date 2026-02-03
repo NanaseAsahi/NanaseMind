@@ -1,4 +1,6 @@
 from transformers import PretrainedConfig
+import torch
+import torch.nn as nn
 
 class NanaseMindConfig(PretrainedConfig):
     model_type = "nanasemind"
@@ -69,3 +71,20 @@ class NanaseMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps: float=1e-6):
+        # dim为输入的最后一维的维度
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def _norm(self, x):
+        # [B, L, d_hidden]
+        x *= torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)
+
+        return x
+
+    def forward(self, x):
+        # type_as == (..., dtype = xxx, device=xxx) 
+        return self.weight * self._norm(x).type_as(x)
