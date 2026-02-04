@@ -81,7 +81,7 @@ class RMSNorm(nn.Module):
     
     def _norm(self, x):
         # [B, L, d_hidden]
-        x *= torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)
+        x *= torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)  # rsqrt = 1/sqrt(...)
 
         return x
 
