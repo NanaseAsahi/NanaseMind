@@ -1,7 +1,9 @@
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple
+import torch.nn.functional as F
+import math
 
 class NanaseMindConfig(PretrainedConfig):
     model_type = "nanasemind"
@@ -143,32 +145,139 @@ def apply_rotary_pos_emd(q, k, cos, sin, unsqueeze_dim: int=1):
     k_embed = (k*cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k)*sin.unsqueeze(unsqueeze_dim))
 
     return q_embed, k_embed
+
+def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
+    """
+    复制kv的每个头 使得K,V的头数与Q的头数相同
+    n_rep: 复制的次数
+
+    等效torch.repeat_interleave(x, dim=2, repeats=n_rep) 
+    但repeat_interleave会复制内存 开销大很多
+    而下面的实现只是在view时改变了shape
+    x: [B, L, n_head, head_dim]
+    """
+    if n_rep == 1:
+        return x
     
+    B, L, H, D = x.shape
+
+    x = x[:, :, :, None, :].expand(B, L, H, n_rep, D).reshape(B, L, H*n_rep, D)
+    return x
+
+class Attention(nn.Module):
+    def __init__(self, args: NanaseMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0, \
+        "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads = args.num_attention_heads  # 当前类中要使用的n_head
+        self.n_local_kv_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // self.n_local_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, self.n_local_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.n_local_kv_heads * self.head_dim, bias=False)
+
+        self.o_proj = nn.Linear(self.n_local_heads * self.head_dim, args.hidden_size, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        self.flash_attention = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
+    
+    def forward(self, 
+                x:torch.Tensor, 
+                pos_emb: Tuple[torch.Tensor, torch.Tensor],  # cos sin
+                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache=False,
+                attention_mask: Optional[torch.Tensor]=None):
+        
+        B, L, _ = x.shape
+
+        # [B, L, n_head*head_dim]  [B, L, n_kv_head*head_dim]
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x) 
+
+        xq = xq.view(B, L, self.n_local_heads, self.head_dim)
+        xk = xk.view(B, L, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(B, L, self.n_local_kv_heads, self.head_dim)
+
+        cos, sin = pos_emb
+        xq, xk = apply_rotary_pos_emd(xq, xk, cos[:L], sin[:L])
+
+        # kv cache
+        if past_kv is not None:
+            # 注意kv cache只在推理时启用 此时token是一个一个输入进来算的
+            # 故在dim=1上拼接
+            xk = torch.cat([past_kv[0], xk], dim=1)
+            xv = torch.cat([past_kv[1], xv], dim=1)
+        
+        past_kv = (xk, xv) if use_cache else None
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),  # [B, L, n_head, dim] -> [B, n_head, L, dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+
+        # 1. torch版本是否符合要求且是否人为要求使用Flash Attention
+        # 2. seq_len是否大于1 因为seq_len=1（也即推理时）时Flash Attention的优势不明显 反而可能更慢
+        # 3. 是否使用kv cache 理由类似2 使用kv cache时即推理时
+        # 4. Flash Attention 默认causal 不支持 mask （Flash Attention自己实现了"不看未来"的mask）
+        if self.flash_attention and (L > 1) and (past_kv is None) and (attention_mask is None or torch.all(attention_mask==1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, n_head, n_q, n_k]
+
+            # causal mask 不看未来
+            # 在训练时scores[B, n_head, n_q, n_k] n_q=n_k=L 实际上就是对scores[:, :, :, :]加上一个mask
+            # 但在推理时 由于有kv cache（假设长度为T）的存在，那么应该是对T之后的scores加上mask 也就是[:, :, :. -L:]
+            scores[:, :, :, -L:] += torch.triu(torch.full((L, L), float('-inf'), device=scores.device), diagonal=1)
+
+            # padding mask 不看padding
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, L]
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores, dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores.matmul(xv)
+
+        # [B, n_head, L, head_dim] -> [B, L, n_head*head_dim]
+        output = output.transpose(1, 2).reshape(B, L, -1)
+        output = self.resid_dropout(self.o_proj(output))
+
+        return output, past_kv
 
 if __name__ == "__main__":
     """RoPE & YaRN Test"""
-    batch_size = 2
-    seq_len = 512
-    num_heads = 8
-    head_dim = 64  # hidden_size // num_heads = 512 // 8 = 64
+    # batch_size = 2
+    # seq_len = 512
+    # num_heads = 8
+    # head_dim = 64  # hidden_size // num_heads = 512 // 8 = 64
 
-    q = torch.randn(batch_size, seq_len, num_heads, head_dim)  # [2, 512, 8, 64]
-    k = torch.randn(batch_size, seq_len, num_heads, head_dim)  # [2, 512, 8, 64]
+    # q = torch.randn(batch_size, seq_len, num_heads, head_dim)  # [2, 512, 8, 64]
+    # k = torch.randn(batch_size, seq_len, num_heads, head_dim)  # [2, 512, 8, 64]
     
-    print("=" * 50)
-    rope_scaling = {
-        "original_max_position_embeddings": 2048,
-        "factor": 4,
-        "beta_fast": 4,
-        "beta_slow": 1,
-        "type": "yarn",
-    }
-    cos_yarn, sin_yarn = precompute_feqs_cis(dim=head_dim, end=seq_len, rope_scaling=rope_scaling)
-    print(f"cos_yarn shape: {cos_yarn.shape}")  # [seq_len, head_dim]
-    print(f"sin_yarn shape: {sin_yarn.shape}")  # [seq_len, head_dim]
+    # print("=" * 50)
+    # rope_scaling = {
+    #     "original_max_position_embeddings": 2048,
+    #     "factor": 4,
+    #     "beta_fast": 4,
+    #     "beta_slow": 1,
+    #     "type": "yarn",
+    # }
+    # cos_yarn, sin_yarn = precompute_feqs_cis(dim=head_dim, end=seq_len, rope_scaling=rope_scaling)
+    # print(f"cos_yarn shape: {cos_yarn.shape}")  # [seq_len, head_dim]
+    # print(f"sin_yarn shape: {sin_yarn.shape}")  # [seq_len, head_dim]
     
-    q_embed_yarn, k_embed_yarn = apply_rotary_pos_emd(q, k, cos_yarn, sin_yarn, unsqueeze_dim=1)
-    print(f"q_embed_yarn shape: {q_embed_yarn.shape}")  # [2, 512, 8, 64]
-    print(f"k_embed_yarn shape: {k_embed_yarn.shape}")  # [2, 512, 8, 64]
+    # q_embed_yarn, k_embed_yarn = apply_rotary_pos_emd(q, k, cos_yarn, sin_yarn, unsqueeze_dim=1)
+    # print(f"q_embed_yarn shape: {q_embed_yarn.shape}")  # [2, 512, 8, 64]
+    # print(f"k_embed_yarn shape: {k_embed_yarn.shape}")  # [2, 512, 8, 64]
 
 
