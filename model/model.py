@@ -1,8 +1,9 @@
-from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
 import torch.nn.functional as F
+from transformers import PretrainedConfig
+from transformers.activations import ACT2FN
+from typing import Optional, Tuple
 import math
 
 class NanaseMindConfig(PretrainedConfig):
@@ -253,6 +254,26 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
 
         return output, past_kv
+    
+class FeedForward(nn.Module):
+    def __init__(self, args: NanaseMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            # 针对SwiGLU GeGLU 让二者的参数量与使用ReLU时相近
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            # 向上取整到64的倍数
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        # ACT2FN是一个dict 将字符串映射到激活函数(torch实现)
+        self.act_fn = ACT2FN[args.hidden_act]
+    
+    def forward(self, x):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
 
 if __name__ == "__main__":
     """RoPE & YaRN Test"""
