@@ -273,6 +273,41 @@ class FeedForward(nn.Module):
     
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+    
+class MOEFeedForward(nn.Module):
+    def __init__(self, args: NanaseMindConfig):
+        super().__init__()
+    
+    def forward(self, x):
+        pass
+    
+class NanaseMindBlock(nn.Module):
+    def __init__(self, layer_id: int, args: NanaseMindConfig):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.head_dim = args.hidden_size // self.num_attention_heads
+        self.attn = Attention(args)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
+        self.post_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
+        self.mlp = FeedForward(args) if not args.use_moe else MOEFeedForward(args)
+    
+    def forward(self, hidden_states, position_embeddings, past_kv=None, use_cache=False, attention_mask=None):
+        # 存储一个Block最初的输入
+        residual = hidden_states
+        hidden_states, present_kv = self.attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_kv,
+            use_cache,
+            attention_mask
+        )
+        hidden_states = hidden_states + residual
+        hidden_states = hidden_states + self.mlp(self.post_layernorm(hidden_states))
+
+        return hidden_states, present_kv
 
 
 if __name__ == "__main__":
