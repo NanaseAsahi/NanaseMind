@@ -3,7 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
-from typing import Optional, Tuple, List
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from typing import Optional, Tuple, List, Union
 import math
 
 class NanaseMindConfig(PretrainedConfig):
@@ -339,7 +341,7 @@ class NanaseMindModel(nn.Module):
                 **kwargs):
         B, L = input_ids.shape
 
-        # if transformers style -> past_kv = None
+        # if transformers style -> past_kv = None 兼容transformers的输入格式
         if hasattr(past_kv, 'layers'): past_kv = None
         past_kv = past_kv or [None] * len(self.layers)
         start_pos = past_kv[0][0].shape[1] if past_kv[0] is not None else 0
@@ -365,11 +367,53 @@ class NanaseMindModel(nn.Module):
 
             hidden_states = self.norm(hidden_states)
 
-            # hidden_states.new_zeros(1).squeeze()创建一个与hidden_states同设备同dtype的标量0 当MoE为空/0时返回0作为aux_loss
-            aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], 
-                           hidden_states.new_zeros(1).squeeze())
+        # hidden_states.new_zeros(1).squeeze()创建一个与hidden_states同设备同dtype的标量0 当MoE为空/0时返回0作为aux_loss
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], 
+                        hidden_states.new_zeros(1).squeeze())
             
         return hidden_states, presents, aux_loss
+    
+class NanaseMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = NanaseMindConfig
+
+    def __init__(self, config: NanaseMindConfig = None):
+        self.config = config or NanaseMindConfig()
+        super().__init__()
+        self.model = NanaseMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight  # 权重共享
+    
+    def forward(self, 
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
+                past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **kwargs):
+        
+        hidden_states, past_kv, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_kv=past_kv,
+            use_cache=use_cache,
+            **kwargs
+        )
+
+        # slice 封装一个切片规则 类似一个切片中传入一个可变的参数 slice(start, end, step) 从start到end-1 每step个取一个
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])  # hidden_states: [:, -logits_to_keep:, :]
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_kv, hidden_states=hidden_states)
+        output.aux_loss = aux_loss
+
+        return output
 
 if __name__ == "__main__":
     """RoPE & YaRN Test"""
