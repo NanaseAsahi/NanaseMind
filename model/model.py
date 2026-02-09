@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import math
 
 class NanaseMindConfig(PretrainedConfig):
@@ -309,6 +309,67 @@ class NanaseMindBlock(nn.Module):
 
         return hidden_states, present_kv
 
+class NanaseMindModel(nn.Module):
+    def __init__(self, args: NanaseMindConfig):
+        super().__init__()
+        self.vocab_size = args.vocab_size
+        self.num_hidden_layers = args.num_hidden_layers
+
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.dropout = nn.Dropout(args.dropout)
+        self.layers = nn.ModuleList([NanaseMindBlock(i, args) for i in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_feqs_cis(
+            dim=args.hidden_size // args.num_attention_heads,
+            end=args.max_position_embeddings,
+            rope_base=args.rope_theta,
+            repe_scaling=args.rope_scaling
+        )
+
+        # 不属于模型参数 但需要跟着模型移动 自动.to(device) 自动进入state_dict(persistent参数决定)
+        self.register_buffer("freq_cos", freqs_cos, persistent=False)
+        self.register_buffer("freq_sin", freqs_sin, persistent=False)
+    
+    def forward(self, 
+                input_ids: Optional[torch.Tensor] = None,  # token -> token id
+                attention_mask: Optional[torch.Tensor] = None,
+                past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]=None,
+                use_cache: bool = False,
+                **kwargs):
+        B, L = input_ids.shape
+
+        # if transformers style -> past_kv = None
+        if hasattr(past_kv, 'layers'): past_kv = None
+        past_kv = past_kv or [None] * len(self.layers)
+        start_pos = past_kv[0][0].shape[1] if past_kv[0] is not None else 0
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos: start_pos + L],
+            self.freqs_sin[start_pos: start_pos + L]
+        )
+
+        presents = [] 
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kv)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_kv=past_kv,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+
+            presents.append(present)
+
+            hidden_states = self.norm(hidden_states)
+
+            # hidden_states.new_zeros(1).squeeze()创建一个与hidden_states同设备同dtype的标量0 当MoE为空/0时返回0作为aux_loss
+            aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], 
+                           hidden_states.new_zeros(1).squeeze())
+            
+        return hidden_states, presents, aux_loss
 
 if __name__ == "__main__":
     """RoPE & YaRN Test"""
