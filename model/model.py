@@ -336,15 +336,15 @@ class NanaseMindModel(nn.Module):
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None,  # token -> token id
                 attention_mask: Optional[torch.Tensor] = None,
-                past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]=None,
+                past_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]=None,
                 use_cache: bool = False,
                 **kwargs):
         B, L = input_ids.shape
 
         # if transformers style -> past_kv = None 兼容transformers的输入格式
-        if hasattr(past_kv, 'layers'): past_kv = None
-        past_kv = past_kv or [None] * len(self.layers)
-        start_pos = past_kv[0][0].shape[1] if past_kv[0] is not None else 0
+        if hasattr(past_kvs, 'layers'): past_kvs = None
+        past_kvs = past_kvs or [None] * len(self.layers)
+        start_pos = past_kvs[0][0].shape[1] if past_kvs[0] is not None else 0
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
@@ -354,7 +354,7 @@ class NanaseMindModel(nn.Module):
         )
 
         presents = [] 
-        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kv)):
+        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
