@@ -34,10 +34,11 @@ class PretrainDataset(Dataset):
         input_ids = tokens['input_ids'].squeeze(0)  # 由于是getitem 去掉batch维度
         loss_mask = input_ids != self.tokenizer.pad_token_id  # 只有非填充部分才计算损失
 
-        X = torch.tensor(input_ids[-1], dtype=torch.long)  # 输入当前token
+        X = torch.tensor(input_ids[:-1], dtype=torch.long)  # 输入当前token
         Y = torch.tensor(input_ids[1:], dtype=torch.long)  # 预测下一个token
-        loss_mask = torch.tensor(loss_mask[:-1], dtype=torch.bool)
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 注意loss_mask要与Y对齐
 
+        # X, Y -> [seq_len-1]
         return X, Y, loss_mask
 
 

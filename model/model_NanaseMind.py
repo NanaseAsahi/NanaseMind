@@ -87,9 +87,8 @@ class RMSNorm(nn.Module):
     
     def _norm(self, x):
         # [B, L, d_hidden]
-        x *= torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)  # rsqrt = 1/sqrt(...)
 
-        return x
+        return x * torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)  # rsqrt = 1/sqrt(...)
 
     def forward(self, x):
         # type_as == (..., dtype = xxx, device=xxx) 
@@ -326,12 +325,12 @@ class NanaseMindModel(nn.Module):
             dim=args.hidden_size // args.num_attention_heads,
             end=args.max_position_embeddings,
             rope_base=args.rope_theta,
-            repe_scaling=args.rope_scaling
+            rope_scaling=args.rope_scaling
         )
 
         # 不属于模型参数 但需要跟着模型移动 自动.to(device) 自动进入state_dict(persistent参数决定)
-        self.register_buffer("freq_cos", freqs_cos, persistent=False)
-        self.register_buffer("freq_sin", freqs_sin, persistent=False)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
     
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None,  # token -> token id
@@ -343,6 +342,7 @@ class NanaseMindModel(nn.Module):
 
         # if transformers style -> past_kv = None 兼容transformers的输入格式
         if hasattr(past_kvs, 'layers'): past_kvs = None
+
         past_kvs = past_kvs or [None] * len(self.layers)
         start_pos = past_kvs[0][0].shape[1] if past_kvs[0] is not None else 0
 
@@ -365,7 +365,8 @@ class NanaseMindModel(nn.Module):
 
             presents.append(present)
 
-            hidden_states = self.norm(hidden_states)
+        # 最终的 LayerNorm 应该在所有 layer 之后只做一次
+        hidden_states = self.norm(hidden_states)
 
         # hidden_states.new_zeros(1).squeeze()创建一个与hidden_states同设备同dtype的标量0 当MoE为空/0时返回0作为aux_loss
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], 
@@ -378,24 +379,25 @@ class NanaseMindForCausalLM(PreTrainedModel, GenerationMixin):
 
     def __init__(self, config: NanaseMindConfig = None):
         self.config = config or NanaseMindConfig()
-        super().__init__()
+        super().__init__(self.config)
         self.model = NanaseMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.model.embed_tokens.weight = self.lm_head.weight  # 权重共享
+        # self.model.embed_tokens.weight = self.lm_head.weight  # 权重共享
+        self.lm_head.weight = self.model.embed_tokens.weight
     
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
-                past_kv: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                past_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **kwargs):
         
-        hidden_states, past_kv, aux_loss = self.model(
+        hidden_states, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_kv=past_kv,
+            past_kvs=past_kvs,
             use_cache=use_cache,
             **kwargs
         )
@@ -410,7 +412,7 @@ class NanaseMindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_kv, hidden_states=hidden_states)
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_kvs, hidden_states=hidden_states)
         output.aux_loss = aux_loss
 
         return output

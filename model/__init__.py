@@ -1,10 +1,12 @@
-from .model import (
+from .model_NanaseMind import (
     NanaseMindConfig,
     Attention,
     RMSNorm,
     precompute_feqs_cis,
     apply_rotary_pos_emd,
-    repeat_kv
+    repeat_kv,
+    NanaseMindModel,
+    NanaseMindForCausalLM
 )
 
 __all__ = [
@@ -13,5 +15,7 @@ __all__ = [
     'RMSNorm',
     'precompute_feqs_cis',
     'apply_rotary_pos_emd',
-    'repeat_kv'
+    'repeat_kv',
+    'NanaseMindModel',
+    'NanaseMindForCausalLM'
 ]
