@@ -9,3 +9,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# logs weights
+logs/
+checkpoints/
+out/
+*.log
+*.pth
+*.pt
+
+
