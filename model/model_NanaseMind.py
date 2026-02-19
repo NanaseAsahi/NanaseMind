@@ -12,36 +12,37 @@ class NanaseMindConfig(PretrainedConfig):
     model_type = "nanasemind"
 
     def __init__(
-        self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
-        
-        ############ MoE ############
-        use_moe:bool=False,
-        num_experts_per_tok:int=2,
-        n_routed_experts:int=4,
-        n_shared_experts:int=1,
-        scoring_func:str='softmax',
-        aux_loss_alpha:float=0.1,
-        seq_aux:bool=True,
-        norm_topk_prob:bool=True,
-        **kwargs,
+            self,
+            dropout: float = 0.0,
+            bos_token_id: int = 1,
+            eos_token_id: int = 2,
+            hidden_act: str = 'silu',
+            hidden_size: int = 512,
+            intermediate_size: int = None,
+            max_position_embeddings: int = 32768,
+            num_attention_heads: int = 8,
+            num_hidden_layers: int = 8,
+            num_key_value_heads: int = 2,
+            vocab_size: int = 6400,
+            rms_norm_eps: float = 1e-05,
+            rope_theta: int = 1000000.0,
+            inference_rope_scaling: bool = False,
+            flash_attn: bool = True,
+            ####################################################
+            # Here are the specific configurations of MOE
+            # When use_moe is false, the following is invalid
+            ####################################################
+            use_moe: bool = False,
+            num_experts_per_tok: int = 2,
+            n_routed_experts: int = 4,
+            n_shared_experts: int = 1,
+            scoring_func: str = 'softmax',
+            aux_loss_alpha: float = 0.01,
+            seq_aux: bool = True,
+            norm_topk_prob: bool = True,
+            **kwargs
     ):
         super().__init__(**kwargs)
-
         self.dropout = dropout
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -56,45 +57,87 @@ class NanaseMindConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
-        self.use_moe=use_moe
-        self.num_experts_per_tok=num_experts_per_tok
-        self.n_routed_experts=n_routed_experts
-        self.n_shared_experts=n_shared_experts
-        self.seq_aux=seq_aux
-        self.norm_topk_prob=norm_topk_prob
-        self.aux_loss_alpha=aux_loss_alpha
-        self.scoring_func=scoring_func
-
-        self.rope_scaling = (
-            {
-                "beta_fast": 4,
-                "beta_slow": 1,
-                "factor": 4,
-                "original_max_position_embeddings": 2048,
-                "type": "yarn",
-            }
-            if self.inference_rope_scaling
-            else None
-        )
+        # 外推长度 = factor * original_max_position_embeddings = 32768
+        self.rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 2048,
+            "attention_factor": 1.0,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
+        self.flash_attn = flash_attn
+        ####################################################
+        # Here are the specific configurations of MOE
+        # When use_moe is false, the following is invalid
+        ####################################################
+        self.use_moe = use_moe
+        self.num_experts_per_tok = num_experts_per_tok  # 每个token选择的专家数量
+        self.n_routed_experts = n_routed_experts  # 总的专家数量
+        self.n_shared_experts = n_shared_experts  # 共享专家
+        self.scoring_func = scoring_func  # 评分函数，默认为'softmax'
+        self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
+        self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
+        self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps: float=1e-6):
-        # dim为输入的最后一维的维度
+    def __init__(self, dim: int, eps: float=1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
     
     def _norm(self, x):
-        # [B, L, d_hidden]
-
-        return x * torch.rsqrt(pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)  # rsqrt = 1/sqrt(...)
-
-    def forward(self, x):
-        # type_as == (..., dtype = xxx, device=xxx) 
-        return self.weight * self._norm(x).type_as(x)
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
     
-def precompute_feqs_cis(dim: int, end: int=32*1024, rope_base:float=1e6, rope_scaling:Optional[dict]=None):
+    def forward(self, x):
+        # x: [B, n_heads, seq_len, d_hidden]
+        return self.weight * self._norm(x.float()).type_as(x)
+
+def precompute_feqs_cis(dim: int, end: int = 32*1024, rope_base: float = 1e6,
+                        rope_scaling: Optional[dict] = None):
+    """
+    Precompute the freqs and cis used for RoPE(correction based YaRN).
+
+    dim: d_hidden // num_head if num_head > 1 else d_hidden
+    end: max seq_len
+    rope_base: the base value for w_k (1000000)
+    rope_scaling: dict or None, for YaRN scaling
+    """
+    # 标准RoPE theta_i = 1 / base ^ (2i/d)
+    freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+        )
+
+        if end / orig_max > 1.0:
+            # 当当前的最大长度大于原本训练时的长度时才缩放
+            # YaRN: f'(i) = f(i)((1-gamma) + gamma/s) where gamma \in [0, 1] is linear ramp
+
+            # 传入b（转了多少圈） 求出在哪个维度上转了b圈 
+            inv_dim = lambda b : (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            # 求得低频、高频的分界维度
+            low, high = max(math.floor(inv_dim(beta_fast), 0)), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1-ramp + ramp / factor)
+    
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emd(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), dim=-1)
+
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    return q_embed, k_embed
+
+def _DEPRECATED_precompute_feqs_cis(dim: int, end: int=32*1024, rope_base:float=1e6, rope_scaling:Optional[dict]=None):
     """
     Precompute the freqs and cis used for RoPE(correction based YaRN).
 
@@ -138,7 +181,7 @@ def precompute_feqs_cis(dim: int, end: int=32*1024, rope_base:float=1e6, rope_sc
 
     return freqs_cos, freqs_sin
 
-def apply_rotary_pos_emd(q, k, cos, sin, unsqueeze_dim: int=1):
+def _DEPRECATED_apply_rotary_pos_emd(q, k, cos, sin, unsqueeze_dim: int=1):
     def rotate_half(x):
         # 将后半部分旋转到前半部分并取-号
         return torch.cat([-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]], dim=-1)
@@ -190,12 +233,12 @@ class Attention(nn.Module):
         self.dropout = args.dropout
 
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        self.flash_attention = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
     
     def forward(self, 
                 x:torch.Tensor, 
-                pos_emb: Tuple[torch.Tensor, torch.Tensor],  # cos sin
-                past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # cos sin
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor]=None):
         
@@ -208,15 +251,15 @@ class Attention(nn.Module):
         xk = xk.view(B, L, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(B, L, self.n_local_kv_heads, self.head_dim)
 
-        cos, sin = pos_emb
-        xq, xk = apply_rotary_pos_emd(xq, xk, cos[:L], sin[:L])
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emd(xq, xk, cos, sin)
 
         # kv cache
-        if past_kv is not None:
+        if past_key_value is not None:
             # 注意kv cache只在推理时启用 此时token是一个一个输入进来算的
             # 故在dim=1上拼接
-            xk = torch.cat([past_kv[0], xk], dim=1)
-            xv = torch.cat([past_kv[1], xv], dim=1)
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
         
         past_kv = (xk, xv) if use_cache else None
 
@@ -230,14 +273,15 @@ class Attention(nn.Module):
         # 2. seq_len是否大于1 因为seq_len=1（也即推理时）时Flash Attention的优势不明显 反而可能更慢
         # 3. 是否使用kv cache 理由类似2 使用kv cache时即推理时
         # 4. Flash Attention 默认causal 不支持 mask （Flash Attention自己实现了"不看未来"的mask）
-        if self.flash_attention and (L > 1) and (past_kv is None) and (attention_mask is None or torch.all(attention_mask==1)):
+        if self.flash and (L > 1) and (past_kv is None) and (attention_mask is None or torch.all(attention_mask==1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             scores = torch.matmul(xq, xk.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [B, n_head, n_q, n_k]
 
             # causal mask 不看未来
-            # 在训练时scores[B, n_head, n_q, n_k] n_q=n_k=L 实际上就是对scores[:, :, :, :]加上一个mask
-            # 但在推理时 由于有kv cache（假设长度为T）的存在，那么应该是对T之后的scores加上mask 也就是[:, :, :. -L:]
+            # 训练时: scores[B, n_head, L, L], 对所有位置应用上三角mask
+            # 推理时: scores[B, n_head, L, T+L], 新输入的L个token可以看到所有cached的T个token
+            #        但新token之间需要causal mask, 因此只对最后L列[:, :, :, -L:]应用上三角mask
             scores[:, :, :, -L:] += torch.triu(torch.full((L, L), float('-inf'), device=scores.device), diagonal=1)
 
             # padding mask 不看padding
@@ -246,7 +290,7 @@ class Attention(nn.Module):
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
-            scores = F.softmax(scores, dim=-1).type_as(xq)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores.matmul(xv)
 
@@ -295,20 +339,20 @@ class NanaseMindBlock(nn.Module):
         self.post_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
         self.mlp = FeedForward(args) if not args.use_moe else MOEFeedForward(args)
     
-    def forward(self, hidden_states, position_embeddings, past_kv=None, use_cache=False, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         # 存储一个Block最初的输入
         residual = hidden_states
-        hidden_states, present_kv = self.attn(
+        hidden_states, present_key_value = self.attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
-            past_kv,
+            past_key_value,
             use_cache,
             attention_mask
         )
         hidden_states = hidden_states + residual
         hidden_states = hidden_states + self.mlp(self.post_layernorm(hidden_states))
 
-        return hidden_states, present_kv
+        return hidden_states, present_key_value
 
 class NanaseMindModel(nn.Module):
     def __init__(self, args: NanaseMindConfig):
@@ -335,16 +379,17 @@ class NanaseMindModel(nn.Module):
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None,  # token -> token id
                 attention_mask: Optional[torch.Tensor] = None,
-                past_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]=None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]=None,
                 use_cache: bool = False,
                 **kwargs):
         B, L = input_ids.shape
 
-        # if transformers style -> past_kv = None 兼容transformers的输入格式
-        if hasattr(past_kvs, 'layers'): past_kvs = None
+        # 兼容transformers
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
 
-        past_kvs = past_kvs or [None] * len(self.layers)
-        start_pos = past_kvs[0][0].shape[1] if past_kvs[0] is not None else 0
+        past_key_values = past_key_values or [None] * len(self.layers)
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
 
@@ -354,11 +399,11 @@ class NanaseMindModel(nn.Module):
         )
 
         presents = [] 
-        for layer_idx, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
-                past_kv=past_kv,
+                past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask
             )
@@ -382,27 +427,29 @@ class NanaseMindForCausalLM(PreTrainedModel, GenerationMixin):
         super().__init__(self.config)
         self.model = NanaseMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        # self.model.embed_tokens.weight = self.lm_head.weight  # 权重共享
-        self.lm_head.weight = self.model.embed_tokens.weight
+        # 权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
     
     def forward(self, 
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
-                past_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **kwargs):
         
-        hidden_states, past_kvs, aux_loss = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_kvs=past_kvs,
+            past_key_values=past_key_values,
             use_cache=use_cache,
             **kwargs
         )
 
         # slice 封装一个切片规则 类似一个切片中传入一个可变的参数 slice(start, end, step) 从start到end-1 每step个取一个
+        # 训练时logits_to_keep=0 则计算所有位置的logits 用于计算loss
+        # 推理时logits_to_keep=1 则取最后一个logits 因为一次只预测一个token
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])  # hidden_states: [:, -logits_to_keep:, :]
 
@@ -412,7 +459,7 @@ class NanaseMindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_kvs, hidden_states=hidden_states)
+        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
 
         return output

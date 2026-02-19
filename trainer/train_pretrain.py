@@ -20,8 +20,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     loss_function = nn.CrossEntropyLoss(reduction='none')
 
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step+1):
-        X, Y, loss_mask = X.to(args.device), Y.to(args.device), loss_mask.to(args.device)
+    for step, (input_ids, labels) in enumerate(loader, start=start_step+1):
+        input_ids, labels= input_ids.to(args.device), labels.to(args.device)
 
         lr = get_lr(epoch*iters+step, iters*args.epochs, args.learning_rate)
 
@@ -31,12 +31,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         
         # 混合精度训练
         with autocast_ctx:
-            res = model(X)
-
-            # res.logits -> [batch, seq_len, vocab_size]  Y -> [batch, seq_len]  loss_mask -> [batch, seq_len]
-            loss = loss_function(res.logits.view(-1, res.logits.shape[-1]), Y.view(-1)).view(Y.shape)
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
             # 梯度累计
             loss = loss / args.accumulation_steps
     
@@ -56,12 +52,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if step % args.log_interval == 0 or (step + 1) == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
 
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
             Logger(
-                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
+                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min"
             )
 
             # 记录到实验跟踪系统
@@ -79,15 +77,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            # DDP模型需要通过.module访问真正的模型
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-
-            # 将float32参数转为float16，减少存储空间
-            state_dict = {k: v.half() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
 
             # 保存完整训练状态
             lm_checkpoint(
@@ -103,6 +96,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             )
 
             model.train()  # 恢复训练模式
+            del state_dict
+        
+        del input_ids, labels, res, loss
+
         
 
 if __name__ == "__main__":
