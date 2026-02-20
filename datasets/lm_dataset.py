@@ -34,7 +34,7 @@ class PretrainDataset(Dataset):
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100  # 计算loss时忽略pad位置
+        labels[input_ids == self.tokenizer.pad_token_id] = -100  # 计算loss时忽略pad位置 loss mask
 
         return input_ids, labels
 

@@ -18,7 +18,6 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     model.train()
     start_time = time.time()
-    loss_function = nn.CrossEntropyLoss(reduction='none')
 
     for step, (input_ids, labels) in enumerate(loader, start=start_step+1):
         input_ids, labels= input_ids.to(args.device), labels.to(args.device)
